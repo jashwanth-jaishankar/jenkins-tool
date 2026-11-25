@@ -291,19 +291,30 @@ def trigger_build():
 
     session = jenkins_session()
     url = job_url("BankOS", "Builds", application, branch)
-    definitions = parameter_definitions(session, url)
+    try:
+        definitions = parameter_definitions(session, url)
 
-    params = {}
-    for definition in definitions:
-        name = definition.get("name")
-        if definition.get("type") == "BooleanParameterDefinition":
-            params[name] = "false"
+        params = {}
+        for definition in definitions:
+            name = definition.get("name")
+            if definition.get("type") == "BooleanParameterDefinition":
+                params[name] = "false"
 
-    # Guardrail: never allow a release build from this automation.
-    if any(d.get("name") == "RELEASE_BUILD" for d in definitions):
-        params["RELEASE_BUILD"] = "false"
+        # Guardrail: never allow a release build from this automation.
+        if any(d.get("name") == "RELEASE_BUILD" for d in definitions):
+            params["RELEASE_BUILD"] = "false"
 
-    queue_url = post_build(session, f"{url}/buildWithParameters", params)
+        # Jobs without parameters reject /buildWithParameters with HTTP 400.
+        endpoint = "buildWithParameters" if definitions else "build"
+        queue_url = post_build(session, f"{url}/{endpoint}", params)
+    except JenkinsError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except requests.Timeout:
+        app.logger.exception("Jenkins timed out while triggering %s/%s", application, branch)
+        return jsonify({"error": "Jenkins timed out. Check that the build was not queued, then retry."}), 504
+    except requests.RequestException as exc:
+        app.logger.exception("Jenkins request failed for %s/%s", application, branch)
+        return jsonify({"error": f"Could not reach Jenkins: {exc}"}), 502
     return jsonify({"queue_url": queue_url, "application": application, "branch": branch})
 
 
