@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jenkins - {% block title %}{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<nav>
+  <a href="/" class="{{ 'active' if request.path == '/' }}">Build &amp; Deploy</a>
+  <a href="/deploy" class="{{ 'active' if request.path == '/deploy' }}">Deploy only</a>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+<script src="{{ url_for('static', filename='common.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

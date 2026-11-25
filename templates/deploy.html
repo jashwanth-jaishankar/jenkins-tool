@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}Deploy only{% endblock %}
+{% block content %}
+<h1>Deploy latest build</h1>
+<div class="sub">Deploys the most recent successful build of the selected application and branch.</div>
+<div class="warning">Deployments change shared environments. A confirmation is required.</div>
+<section class="card">
+  <div class="grid">
+    <div>
+      <label>Application</label>
+      <input type="text" id="appFilter" placeholder="Filter applications..." autocomplete="off">
+      <select id="app"><option value="">Loading applications...</option></select>
+    </div>
+    <div>
+      <label>Branch</label>
+      <input type="text" id="branchFilter" placeholder="Filter branches..." autocomplete="off" disabled>
+      <select id="branch" disabled><option value="">Select application first</option></select>
+    </div>
+  </div>
+  <label for="environment">Environment</label>
+  <select id="environment"><option value="">Loading environments...</option></select>
+  <div id="latest" class="status hidden"></div>
+  <button class="primary" id="deployButton" type="button" disabled>Deploy latest build</button>
+  <div id="deployStatus" class="status hidden"></div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+let allApplications = [], allBranches = [], latest = null, deploying = false, branchReq = 0, latestReq = 0;
+
+function updateButton() {
+  $("deployButton").disabled = deploying || !latest || !$("environment").value;
+}
+
+async function fetchLatest() {
+  const application = $("app").value, branch = $("branch").value;
+  return api(`/api/latest-build?application=${encodeURIComponent(application)}&branch=${encodeURIComponent(branch)}`);
+}
+
+function describe(d) {
+  const when = d.timestamp ? new Date(d.timestamp).toLocaleString() : "unknown time";
+  return `Latest successful build: #${d.build_number} (${when})\nVersion: ${d.version}`;
+}
+
+async function loadLatest() {
+  const id = ++latestReq;
+  latest = null;
+  updateButton();
+  if (!$("app").value || !$("branch").value) { hide("latest"); return; }
+  show("latest", "Fetching latest build...");
+  try {
+    const d = await fetchLatest();
+    if (id !== latestReq) return;
+    latest = d;
+    show("latest", describe(d), "success");
+  } catch (e) {
+    if (id !== latestReq) return;
+    fail("latest", e.message);
+  }
+  updateButton();
+}
+
+async function loadBranches() {
+  const application = $("app").value, id = ++branchReq;
+  allBranches = [];
+  $("branchFilter").value = "";
+  $("branchFilter").disabled = $("branch").disabled = true;
+  setOptions($("branch"), [], application ? "Loading branches..." : "Select application first");
+  loadLatest();
+  if (!application) return;
+  try {
+    const d = await api(`/api/branches?application=${encodeURIComponent(application)}`);
+    if (id !== branchReq) return;
+    allBranches = d.branches || [];
+    setOptions($("branch"), allBranches, allBranches.length ? "Select branch" : "No branches found");
+    $("branch").disabled = $("branchFilter").disabled = !allBranches.length;
+  } catch (e) {
+    if (id !== branchReq) return;
+    setOptions($("branch"), [], "Could not load branches");
+    fail("latest", e.message);
+  }
+}
+
+$("appFilter").addEventListener("input", () => {
+  const before = $("app").value;
+  const m = renderFiltered($("app"), allApplications, $("appFilter").value, "Select application", "No matches");
+  $("app").disabled = !m.length;
+  if ($("app").value !== before) loadBranches();
+});
+$("branchFilter").addEventListener("input", () => {
+  const before = $("branch").value;
+  const m = renderFiltered($("branch"), allBranches, $("branchFilter").value, "Select branch", "No matches");
+  $("branch").disabled = !m.length;
+  if ($("branch").value !== before) loadLatest();
+});
+$("app").addEventListener("change", loadBranches);
+$("branch").addEventListener("change", loadLatest);
+$("environment").addEventListener("change", updateButton);
+
+$("deployButton").addEventListener("click", async () => {
+  const environment = $("environment").value, application = $("app").value;
+  if (!environment || !latest) return;
+  deploying = true;
+  updateButton();
+  hide("deployStatus");
+  try {
+    // Re-fetch right before deploying so a build finished meanwhile is picked up.
+    const d = await fetchLatest();
+    latest = d;
+    show("latest", describe(d), "success");
+    const ok = window.confirm(
+      `Trigger Jenkins DEPLOYMENT?\n\nApplication: ${application}\nBranch: ${d.branch}\nBuild: #${d.build_number}\nVersion: ${d.version}\nEnvironment: ${environment}`);
+    if (!ok) { deploying = false; updateButton(); return; }
+    show("deployStatus", "Submitting deployment request...");
+    const data = await api("/api/deploy", {
+      method: "POST",
+      body: JSON.stringify({application, environment, version: d.version, confirm: true})
+    });
+    pollStatus("/api/deploy-status", data.queue_url, "deployStatus", () => { deploying = false; updateButton(); });
+  } catch (e) {
+    fail("deployStatus", e.message);
+    deploying = false;
+    updateButton();
+  }
+});
+
+(async () => {
+  try {
+    const d = await api("/api/environments");
+    setOptions($("environment"), d.environments || [], "Select environment");
+  } catch (e) {
+    setOptions($("environment"), [], "Could not load environments");
+    fail("deployStatus", e.message);
+  }
+  try {
+    allApplications = (await api("/api/applications")).applications || [];
+    setOptions($("app"), allApplications, allApplications.length ? "Select application" : "No applications found");
+    $("app").disabled = !allApplications.length;
+  } catch (e) {
+    setOptions($("app"), [], "Could not load applications");
+    fail("latest", e.message);
+  }
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,336 @@
+{% extends "base.html" %}
+{% block title %}Build & Deploy{% endblock %}
+{% block content %}
+  <h1>Jenkins Build & Deploy</h1>
+  <div class="sub">Trigger existing Jenkins jobs and monitor their progress.</div>
+
+  <div class="warning">
+    Builds and deployments change shared environments. Each operation requires a separate confirmation.
+    RELEASE_BUILD is always forced to false.
+  </div>
+
+  <section class="card">
+    <h2>1. Select builds</h2>
+    <fieldset id="buildRows"></fieldset>
+    <button class="secondary" id="addRow" type="button">+ Add build</button>
+    <button class="secondary" id="refresh" type="button">Refresh applications / branches</button>
+    <button class="primary" id="buildButton" type="button" disabled>Build</button>
+    <div id="buildStatus" class="status hidden"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Deploy generated builds</h2>
+    <label for="environment">Environment (applies to all selected builds)</label>
+    <select id="environment"><option value="">Loading environments...</option></select>
+    <div id="deployEmpty" class="small" style="margin-top:12px">Successful builds will appear here.</div>
+    <div id="deployList"></div>
+    <div id="deployWarning" class="warning hidden" style="margin-top:12px"></div>
+    <button class="primary" id="deployButton" type="button" disabled>Deploy selected</button>
+    <div id="deployStatus" class="status hidden"></div>
+  </section>
+  <p class="small">Runs locally at 127.0.0.1. Keep this application private and do not share your .env file.</p>
+{% endblock %}
+{% block scripts %}
+<script>
+let allApplications = [];
+const rows = [];
+const deployEntries = [];
+let buildsRunning = false;
+let deploying = 0;
+
+/* ---------- Build rows ---------- */
+
+function updateBuildButton() {
+  $("buildButton").disabled = buildsRunning || rows.length === 0 ||
+    !rows.every(r => r.appSel.value && r.brSel.value);
+}
+function updateRemoveButtons() {
+  for (const r of rows) r.removeBtn.classList.toggle("hidden", rows.length === 1);
+}
+function setBuildsRunning(flag) {
+  buildsRunning = flag;
+  $("buildRows").disabled = flag;
+  $("addRow").disabled = flag;
+  $("refresh").disabled = flag;
+  updateBuildButton();
+}
+
+function createRow() {
+  const node = document.createElement("div");
+  node.className = "entry";
+  node.innerHTML = `
+    <div class="grid">
+      <div>
+        <label>Application</label>
+        <input type="text" class="appFilter" placeholder="Filter applications..." autocomplete="off">
+        <select class="app"></select>
+      </div>
+      <div>
+        <label>Branch</label>
+        <input type="text" class="branchFilter" placeholder="Filter branches..." autocomplete="off" disabled>
+        <select class="branch" disabled><option value="">Select application first</option></select>
+      </div>
+    </div>
+    <button class="secondary remove" type="button">&times; Remove</button>
+    <div class="status hidden"></div>`;
+  const row = {
+    node,
+    appFilter: node.querySelector(".appFilter"),
+    appSel: node.querySelector("select.app"),
+    brFilter: node.querySelector(".branchFilter"),
+    brSel: node.querySelector("select.branch"),
+    removeBtn: node.querySelector(".remove"),
+    status: node.querySelector(".status"),
+    allBranches: [],
+    req: 0
+  };
+
+  const hasApps = allApplications.length > 0;
+  setOptions(row.appSel, allApplications, hasApps ? "Select application" : "No applications found");
+  row.appSel.disabled = !hasApps;
+  row.appFilter.disabled = !hasApps;
+
+  row.appSel.addEventListener("change", () => loadRowBranches(row));
+  row.brSel.addEventListener("change", updateBuildButton);
+  row.appFilter.addEventListener("input", () => {
+    const before = row.appSel.value;
+    const matches = renderFiltered(row.appSel, allApplications, row.appFilter.value,
+      "Select application", "No matches");
+    row.appSel.disabled = matches.length === 0;
+    if (row.appSel.value !== before) loadRowBranches(row);
+  });
+  row.brFilter.addEventListener("input", () => {
+    const matches = renderFiltered(row.brSel, row.allBranches, row.brFilter.value,
+      "Select branch", "No matches");
+    row.brSel.disabled = matches.length === 0;
+    updateBuildButton();
+  });
+  row.removeBtn.addEventListener("click", () => {
+    if (rows.length === 1) return;
+    rows.splice(rows.indexOf(row), 1);
+    node.remove();
+    updateRemoveButtons();
+    updateBuildButton();
+  });
+
+  rows.push(row);
+  $("buildRows").appendChild(node);
+  updateRemoveButtons();
+  updateBuildButton();
+  return row;
+}
+
+async function loadRowBranches(row) {
+  const application = row.appSel.value;
+  const requestId = ++row.req;
+  row.allBranches = [];
+  row.brFilter.value = "";
+  row.brFilter.disabled = true;
+  row.brSel.disabled = true;
+  hide(row.status);
+  setOptions(row.brSel, [], application ? "Loading branches..." : "Select application first");
+  updateBuildButton();
+  if (!application) return;
+
+  try {
+    const data = await api(`/api/branches?application=${encodeURIComponent(application)}`);
+    if (requestId !== row.req) return;
+    const branches = data.branches || [];
+    row.allBranches = branches;
+    setOptions(row.brSel, branches, branches.length ? "Select branch" : "No branches found");
+    row.brSel.disabled = branches.length === 0;
+    row.brFilter.disabled = branches.length === 0;
+    if (!branches.length) fail(row.status, `No branch jobs were found for ${application}.`);
+  } catch (e) {
+    if (requestId !== row.req) return;
+    setOptions(row.brSel, [], "Could not load branches");
+    fail(row.status, `Could not load branches for ${application}: ${e.message}`);
+  }
+  updateBuildButton();
+}
+
+async function loadEnvironments() {
+  try {
+    const data = await api("/api/environments");
+    setOptions($("environment"), data.environments || [], "Select environment");
+  } catch (e) {
+    setOptions($("environment"), [], "Could not load environments");
+    fail("deployStatus", `Could not load environments: ${e.message}`);
+  }
+}
+
+async function loadApplications() {
+  $("refresh").disabled = true;
+  $("addRow").disabled = true;
+  $("buildButton").disabled = true;
+  rows.length = 0;
+  $("buildRows").innerHTML = "";
+  hide("buildStatus");
+
+  try {
+    const data = await api("/api/applications");
+    allApplications = data.applications || [];
+  } catch (e) {
+    allApplications = [];
+    fail("buildStatus", `Could not load Jenkins applications: ${e.message}`);
+  }
+  const row = createRow();
+  if (!allApplications.length) {
+    if ($("buildStatus").classList.contains("hidden")) {
+      fail("buildStatus", "Jenkins returned no application folders under BankOS/Builds.");
+    }
+  } else if (allApplications.includes("galaxy-fx")) {
+    row.appSel.value = "galaxy-fx";
+    await loadRowBranches(row);
+  }
+  $("refresh").disabled = buildsRunning;
+  $("addRow").disabled = buildsRunning;
+}
+
+$("addRow").addEventListener("click", () => {
+  const row = createRow();
+  row.appFilter.focus();
+});
+$("refresh").addEventListener("click", () => {
+  loadEnvironments();
+  loadApplications();
+});
+
+/* ---------- Status polling ---------- */
+
+
+/* ---------- Build ---------- */
+
+$("buildButton").addEventListener("click", () => {
+  const items = rows.map(row => ({row, application: row.appSel.value, branch: row.brSel.value}));
+  if (!items.length || items.some(i => !i.application || !i.branch)) return;
+
+  const keys = new Set(items.map(i => `${i.application}\u0000${i.branch}`));
+  if (keys.size !== items.length) {
+    fail("buildStatus", "Two rows have the same application and branch. Remove the duplicate.");
+    return;
+  }
+  hide("buildStatus");
+
+  const list = items.map(i => `  - ${i.application} / ${i.branch}`).join("\n");
+  const confirmed = window.confirm(
+    `Trigger ${items.length} Jenkins BUILD${items.length > 1 ? "S" : ""}?\n\n${list}\n\nRELEASE_BUILD will remain false.`
+  );
+  if (!confirmed) return;
+
+  clearDeployList();
+  setBuildsRunning(true);
+  let pending = items.length;
+  const finished = () => { if (--pending === 0) setBuildsRunning(false); };
+
+  for (const {row, application, branch} of items) {
+    show(row.status, "Submitting build request...");
+    api("/api/build", {
+      method: "POST",
+      body: JSON.stringify({application, branch, confirm: true})
+    }).then(data => {
+      pollStatus("/api/build-status", data.queue_url, row.status, result => {
+        if (result.state === "SUCCESS" && result.version) {
+          addDeployEntry({application, branch, version: result.version});
+          show(row.status, `${result.message}\nGenerated version: ${result.version}\n${result.url}`, "success");
+        } else if (result.state === "SUCCESS") {
+          fail(row.status, `${result.message}\nBuild succeeded, but the SNAPSHOT version could not be extracted. Verify the Jenkins console before deploying.\n${result.url || ""}`);
+        }
+        finished();
+      });
+    }).catch(e => {
+      fail(row.status, e.message);
+      finished();
+    });
+  }
+});
+
+/* ---------- Deploy ---------- */
+
+function updateDeployButton() {
+  const anyChecked = deployEntries.some(e => e.checkbox.checked);
+  $("deployButton").disabled = deploying > 0 || !anyChecked || !$("environment").value;
+  $("deployEmpty").classList.toggle("hidden", deployEntries.length > 0);
+
+  const counts = {};
+  for (const e of deployEntries) {
+    if (e.checkbox.checked) counts[e.application] = (counts[e.application] || 0) + 1;
+  }
+  const dup = Object.keys(counts).filter(a => counts[a] > 1);
+  if (dup.length) {
+    show("deployWarning", `Multiple builds of ${dup.join(", ")} are selected. Deploying them to the same environment will overwrite each other; uncheck all but one.`);
+  } else {
+    hide("deployWarning");
+  }
+}
+
+function clearDeployList() {
+  deployEntries.length = 0;
+  $("deployList").innerHTML = "";
+  hide("deployStatus");
+  updateDeployButton();
+}
+
+function addDeployEntry({application, branch, version}) {
+  const node = document.createElement("div");
+  node.className = "entry deploy-entry";
+  const label = document.createElement("label");
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = true;
+  label.appendChild(checkbox);
+  label.appendChild(document.createTextNode(`${application} / ${branch}  -  ${version}`));
+  const status = document.createElement("div");
+  status.className = "status hidden";
+  node.appendChild(label);
+  node.appendChild(status);
+  $("deployList").appendChild(node);
+
+  checkbox.addEventListener("change", updateDeployButton);
+  deployEntries.push({application, branch, version, checkbox, status});
+  updateDeployButton();
+}
+
+$("environment").addEventListener("change", updateDeployButton);
+
+$("deployButton").addEventListener("click", () => {
+  const environment = $("environment").value;
+  const picked = deployEntries.filter(e => e.checkbox.checked);
+  if (!environment || !picked.length) return;
+
+  const list = picked.map(e => `  - ${e.application}: ${e.version}`).join("\n");
+  const confirmed = window.confirm(
+    `Trigger ${picked.length} Jenkins DEPLOYMENT${picked.length > 1 ? "S" : ""}?\n\nEnvironment: ${environment}\n\n${list}\n\nConfirm only if these details are correct.`
+  );
+  if (!confirmed) return;
+
+  hide("deployStatus");
+  deploying = picked.length;
+  for (const e of picked) e.checkbox.disabled = true;
+  updateDeployButton();
+  const finished = entry => {
+    entry.checkbox.disabled = false;
+    deploying--;
+    updateDeployButton();
+  };
+
+  for (const entry of picked) {
+    show(entry.status, "Submitting deployment request...");
+    api("/api/deploy", {
+      method: "POST",
+      body: JSON.stringify({
+        application: entry.application, environment, version: entry.version, confirm: true
+      })
+    }).then(data => {
+      pollStatus("/api/deploy-status", data.queue_url, entry.status, () => finished(entry));
+    }).catch(err => {
+      fail(entry.status, err.message);
+      finished(entry);
+    });
+  }
+});
+
+loadEnvironments();
+loadApplications();
+</script>
+{% endblock %}
